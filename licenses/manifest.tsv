@@ -1,0 +1,16 @@
+# The licence texts a program that links @kama/freetype carries, in the shape of @kama/rmlui's licenses/manifest.tsv.
+#
+# COLUMNS, tab-separated
+#   key       an identifier for a consumer's own manifest or credits check
+#   legs      which builds CONTAIN the component: `native` and `web` (FreeType is compiled into both)
+#   licence   the SPDX-ish id, short enough for a credits screen
+#   text      path to the full text, relative to this package's root, committed and vendored by tools/vendor-freetype.sh
+#   screen    the name a credits screen shows
+#
+# ⚠️ FreeType is dual FTL / GPLv2; this package TAKES THE FTL. The FTL asks a binary's documentation to say that the
+# software is based in part on the work of the FreeType Team (README.md, "What a program that ships this must carry").
+# ⚠️ src/base/fthash.c is compiled into every build and carries its own MIT notice, so it is a row of its own.
+#
+# key	legs	licence	text	screen
+freetype	native web	FTL	third_party/freetype/docs/FTL.TXT	FreeType 2.14.3
+freetype-fthash	native web	MIT	licenses/FreeType-fthash-MIT.txt	FreeType hashing (Computing Research Labs, NMSU; F. Zappa Nardelli)

@@ -1,0 +1,15 @@
+{
+  "name": "freetype_tests",
+  "version": "0.1.0",
+  "kind": "executable",
+  "kama": ">=0.9.577",
+  "entry": "src/main.kama",
+  "dependencies": { "@kama/freetype": { "path": ".." } },
+  "modules": { ".": { "visibility": "internal" } },
+  "select": {
+    "TARGET": {
+      "WASM": { "ldflags": ["--embed-file", "tests/fonts/LatoLatin-Regular.ttf",
+                            "--embed-file", "tests/fonts/SourceCodePro-Regular.otf"] }
+    }
+  }
+}

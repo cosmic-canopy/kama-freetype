@@ -1,0 +1,15 @@
+The test fonts. Committed for the tests, never published (kama.json's `publish.exclude` names tests/), and never part
+of a program. Both are unmodified, so the OFL's Reserved Font Name clause does not come into play.
+
+LatoLatin-Regular.ttf      TrueType (glyf) outlines, hinted, with a legacy 'kern' table
+  from     RmlUi 6.3 (commit ba95ffe8bfb6370efb2cdcca927eaad4710c5413), Samples/assets/LatoLatin-Regular.ttf
+  sha256   d785334ac4e7810f571def986bbad41161f68ac385db8813f798bf04d71478e1
+  licence  SIL Open Font License 1.1. Copyright (c) 2010-2015 Łukasz Dziedzic, Reserved Font Name "Lato".
+           LatoLatin-OFL.txt is lines 4-109 of RmlUi's Samples/assets/LICENSE.txt (the Lato section), verbatim.
+
+SourceCodePro-Regular.otf  OpenType with CFF outlines, monospaced, no 'kern' table
+  from     https://github.com/adobe-fonts/source-code-pro, branch `release`, OTF/SourceCodePro-Regular.otf
+           (fetched 2026-10-13)
+  sha256   9f9664e2edf6f045c11e774f9bd0be6993971f2544a39061a5ce478b96b051f8
+  licence  SIL Open Font License 1.1. (c) 2023 Adobe, Reserved Font Name "Source".
+           SourceCodePro-OFL.md is that repository's LICENSE.md, verbatim.

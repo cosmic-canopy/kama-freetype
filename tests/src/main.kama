@@ -1,0 +1,449 @@
+// @kama/freetype's tests: one program, run from the package root by tools/test.sh (debug and release) and
+// tools/test-wasm.sh (node). A failing case prints its name; the last line counts them.
+//
+// The fonts are tests/fonts/ (tests/fonts/SOURCES: where each came from, its licence). Every number the tests expect of
+// a font is in facts.kama, which tools/font-facts.py reads out of the font's own tables with no font library.
+
+import {
+    core::println,
+    std::fs::readFile,
+    std::io::IoError,
+    std::collections::ConstView,
+    std::collections::DynamicArray,
+    freetype::FreeType,
+    freetype::FreeTypeError,
+    freetype::Face,
+    freetype::FaceMetrics,
+    freetype::SizeMetrics,
+    freetype::Glyph,
+    freetype::GlyphMetrics,
+    freetype::Hinting,
+    freetype::KerningMode,
+    LATO_UPM, LATO_ASCENDER, LATO_DESCENDER, LATO_HEIGHT, LATO_GLYPHS, LATO_GLYPH_A, LATO_GLYPH_T, LATO_GLYPH_O,
+    LATO_ADVANCE_A, LATO_KERN_TO, LATO_KERN_AA,
+    SCP_UPM, SCP_ASCENDER, SCP_DESCENDER, SCP_GLYPHS, SCP_GLYPH_A, SCP_GLYPH_W, SCP_GLYPH_I, SCP_ADVANCE,
+};
+
+type value Tally {
+    public int32 run;
+    public int32 failed;
+
+    public ctor zero()
+    {
+        this.run = 0;
+        this.failed = 0;
+    }
+}
+
+fn void check(ref Tally t, bool ok, const ref string what)
+{
+    t.run = t.run + 1;
+    if (!ok) {
+        t.failed = t.failed + 1;
+        println(s: "  FAIL ${what}");
+    }
+}
+
+fn string latoPath() { return "tests/fonts/LatoLatin-Regular.ttf"; }
+fn string scpPath() { return "tests/fonts/SourceCodePro-Regular.otf"; }
+
+// A design-unit length at `ppem` pixels per em, in 26.6, as FreeType scales it (FT_MulFix rounds to nearest).
+fn int32 scaled(int32 units, int32 ppem, int32 upm)
+{
+    int64 v = cast<int64>(units) * cast<int64>(ppem) * 64;
+    int64 half = cast<int64>(upm) / 2;
+    if (v < 0) { return cast<int32>((v - half) / cast<int64>(upm)); }
+    return cast<int32>((v + half) / cast<int64>(upm));
+}
+
+fn bool near(int32 a, int32 b, int32 slack)
+{
+    int32 d = a - b;
+    return d <= slack && d >= -slack;
+}
+
+// What a rendered glyph's coverage holds: pixels with any ink, pixels fully covered, the partly covered edge pixels
+// anti-aliasing leaves, and the rows with ink.
+type value Ink {
+    public int32 inked;
+    public int32 full;
+    public int32 partial;
+    public int32 inkedRows;
+
+    public ctor zero()
+    {
+        this.inked = 0;
+        this.full = 0;
+        this.partial = 0;
+        this.inkedRows = 0;
+    }
+}
+
+fn Ink inkOf(const ref Glyph g)
+{
+    Ink k = Ink.zero();
+    int32 y = 0;
+    while (y < g.rows()) {
+        bool rowInked = false;
+        int32 x = 0;
+        while (x < g.width()) {
+            uint8 v = g.at(x: x, y: y);
+            if (v != 0) {
+                k.inked = k.inked + 1;
+                rowInked = true;
+            }
+            if (v == 255) { k.full = k.full + 1; }
+            if (v != 0 && v != 255) { k.partial = k.partial + 1; }
+            x = x + 1;
+        }
+        if (rowInked) { k.inkedRows = k.inkedRows + 1; }
+        y = y + 1;
+    }
+    return k;
+}
+
+// The same bitmap, byte for byte.
+fn bool sameBitmap(const ref Glyph a, const ref Glyph b)
+{
+    if (a.width() != b.width() || a.rows() != b.rows() || a.left() != b.left() || a.top() != b.top()) { return false; }
+    int32 y = 0;
+    while (y < a.rows()) {
+        int32 x = 0;
+        while (x < a.width()) {
+            if (a.at(x: x, y: y) != b.at(x: x, y: y)) { return false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return true;
+}
+
+// `view()` is the same bytes `at` reads, row by row.
+fn bool pixelsAgree(const ref Glyph g)
+{
+    bool ok = true;
+    borrow g.view() as px {
+        if (px.length() != cast<isize>(g.width()) * cast<isize>(g.rows())) { ok = false; }
+        isize i = 0;
+        while (ok && i < px.length()) {
+            int32 x = cast<int32>(i % cast<isize>(g.width()));
+            int32 y = cast<int32>(i / cast<isize>(g.width()));
+            if (px[i] != g.at(x: x, y: y)) { ok = false; }
+            i = i + 1;
+        }
+    }
+    return ok;
+}
+
+// A face whose library is gone by the time it returns: the face keeps FreeType alive (kama_freetype.h).
+fn Result<Face, FreeTypeError> faceOutlivingItsLibrary()
+{
+    Result<FreeType, FreeTypeError> started = FreeType.init();
+    FreeType ft = match (give started) {
+        case Ok(value: f): give f;
+        case Err(error: e): { return Result::Err(error: give e); }
+    };
+    string path = latoPath();
+    return Face.open(library: ft, path: path, index: 0);
+}
+
+fn void trueTypeFace(ref Tally t, const ref FreeType ft)
+{
+    string path = latoPath();
+    Result<Face, FreeTypeError> opened = Face.open(library: ft, path: path, index: 0);
+    Face face = match (give opened) {
+        case Ok(value: f): give f;
+        case Err(error: e): {
+            string why = e.message();
+            check(t: t, ok: false, what: "Lato opens from a file: ${why}");
+            return;
+        }
+    };
+    check(t: t, ok: true, what: "Lato opens from a file");
+
+    // ---- the face ----
+    string family = face.familyName();
+    string style = face.styleName();
+    check(t: t, ok: family.startsWith(prefix: "Lato"), what: "the family is Lato's ('${family}')");
+    check(t: t, ok: style == "Regular", what: "the style is Regular ('${style}')");
+    int32 faces = face.faceCount();
+    int32 glyphs = face.glyphCount();
+    check(t: t, ok: faces == 1 && face.faceIndex() == 0, what: "one face in the file, and this is it (${faces})");
+    check(t: t, ok: glyphs == LATO_GLYPHS, what: "the glyph count is maxp's (${glyphs}, want ${LATO_GLYPHS})");
+    check(t: t, ok: face.isScalable() && face.isSfnt() && !face.isCff(), what: "scalable TrueType outlines in an SFNT");
+    check(t: t, ok: face.hasKerning(), what: "the 'kern' table is seen");
+    check(t: t, ok: !face.isFixedWidth() && !face.isItalic() && !face.isBold() && !face.isVariable(),
+          what: "proportional, upright, regular weight, not variable");
+    check(t: t, ok: face.fixedSizeCount() == 0, what: "no embedded bitmap strikes");
+    FaceMetrics m = face.metrics();
+    check(t: t, ok: m.unitsPerEm == LATO_UPM, what: "units per em are head's (${m.unitsPerEm}, want ${LATO_UPM})");
+    check(t: t, ok: m.ascender == LATO_ASCENDER && m.descender == LATO_DESCENDER && m.height == LATO_HEIGHT,
+          what: "the line metrics are the font's (${m.ascender} ${m.descender} ${m.height})");
+    SizeMetrics unset = face.sizeMetrics();
+    check(t: t, ok: unset.yPpem == 0, what: "no size before one is set (${unset.yPpem})");
+
+    // ---- code points to glyphs ----
+    uint32 a = face.glyphIndex(codepoint: 65);
+    uint32 tee = face.glyphIndex(codepoint: 84);
+    uint32 o = face.glyphIndex(codepoint: 111);
+    check(t: t, ok: a == LATO_GLYPH_A && tee == LATO_GLYPH_T && o == LATO_GLYPH_O,
+          what: "A, T and o map to cmap's glyphs (${a} ${tee} ${o})");
+    uint32 missing = face.glyphIndex(codepoint: 1114109);
+    check(t: t, ok: missing == 0, what: "an unmapped code point is glyph 0 (${missing})");
+
+    // ---- a size ----
+    Result<Unit, FreeTypeError> sized = face.setPixelSize(width: 0, height: 32);
+    bool sizeOk = match (sized) { case Ok(value: u): true; case Err(error: e): false; };
+    SizeMetrics s = face.sizeMetrics();
+    check(t: t, ok: sizeOk && s.xPpem == 32 && s.yPpem == 32, what: "32 px per em, both ways (${s.xPpem} x ${s.yPpem})");
+    int32 wantAsc = scaled(units: LATO_ASCENDER, ppem: 32, upm: LATO_UPM);
+    check(t: t, ok: near(a: s.ascender, b: wantAsc, slack: 64) && s.ascender % 64 == 0,
+          what: "the scaled ascender, rounded to a pixel (${s.ascender}, design ${wantAsc})");
+    check(t: t, ok: s.descender < 0 && s.height > s.ascender - s.descender - 64,
+          what: "a descender below the baseline and a line at least as tall (${s.descender} ${s.height})");
+
+    // ---- advances ----
+    int32 wantA = scaled(units: LATO_ADVANCE_A, ppem: 32, upm: LATO_UPM);
+    int32 unhinted = face.advance(glyph: a, hinting: Hinting::None);
+    check(t: t, ok: near(a: unhinted, b: wantA, slack: 1),
+          what: "A's unhinted advance is hmtx's, scaled (${unhinted}, want ${wantA})");
+    int32 hinted = face.advance(glyph: a, hinting: Hinting::Default);
+    check(t: t, ok: hinted % 64 == 0 && near(a: hinted, b: wantA, slack: 64),
+          what: "A's hinted advance is a whole pixel near it (${hinted})");
+
+    // ---- kerning ----
+    int32 unscaled = face.kerning(left: tee, right: o, mode: KerningMode::Unscaled);
+    check(t: t, ok: unscaled == LATO_KERN_TO, what: "T-o kerns by the kern table's pair (${unscaled}, want ${LATO_KERN_TO})");
+    int32 unfitted = face.kerning(left: tee, right: o, mode: KerningMode::Unfitted);
+    int32 wantKern = scaled(units: LATO_KERN_TO, ppem: 32, upm: LATO_UPM);
+    check(t: t, ok: near(a: unfitted, b: wantKern, slack: 1), what: "...scaled to 32 px (${unfitted}, want ${wantKern})");
+    int32 fitted = face.kerning(left: tee, right: o, mode: KerningMode::Default);
+    check(t: t, ok: fitted % 64 == 0 && fitted < 0, what: "...and grid-fitted to a whole pixel (${fitted})");
+    int32 none = face.kerning(left: a, right: a, mode: KerningMode::Unscaled);
+    check(t: t, ok: none == LATO_KERN_AA && none == 0, what: "A-A is not a kerned pair (${none})");
+
+    // ---- rendering ----
+    Result<Glyph, FreeTypeError> renderedA = face.render(glyph: a, hinting: Hinting::Light);
+    Glyph ga = match (give renderedA) {
+        case Ok(value: g): give g;
+        case Err(error: e): {
+            string why = e.message();
+            check(t: t, ok: false, what: "A renders: ${why}");
+            return;
+        }
+    };
+    int32 w = ga.width();
+    int32 r = ga.rows();
+    int32 top = ga.top();
+    uint32 gaIndex = ga.index();
+    check(t: t, ok: gaIndex == a, what: "the rendered glyph is A (${gaIndex})");
+    check(t: t, ok: w >= 16 && w <= 26 && r >= 20 && r <= 26,
+          what: "A's bitmap is a capital's size at 32 px (${w} x ${r})");
+    check(t: t, ok: top == r && top <= (s.ascender + 63) / 64, what: "it stands on the baseline, under the ascender (top ${top})");
+    Ink ink = inkOf(g: ga);
+    int32 area = w * r;
+    check(t: t, ok: ink.inkedRows == r, what: "every row of A has ink (${ink.inkedRows} of ${r})");
+    check(t: t, ok: ink.inked * 10 >= area * 2 && ink.inked * 10 <= area * 7,
+          what: "A covers a letter's share of its box (${ink.inked} of ${area} pixels)");
+    check(t: t, ok: ink.full > 0 && ink.partial > 0, what: "solid stems and anti-aliased edges (${ink.full} full, ${ink.partial} partial)");
+    check(t: t, ok: ga.at(x: 0, y: r - 1) != 0 || ga.at(x: 1, y: r - 1) != 0,
+          what: "A's left foot is inked at the bottom-left");
+    check(t: t, ok: ga.at(x: w / 2, y: r - 1) == 0, what: "and between its feet, at the bottom middle, is empty");
+    check(t: t, ok: pixelsAgree(g: ga), what: "view() is the bytes at() reads, top row first");
+    GlyphMetrics gm = ga.metrics();
+    check(t: t, ok: gm.advanceX > 0 && gm.advanceY == 0 && gm.width > 0 && gm.bearingY > 0,
+          what: "A's metrics (advance ${gm.advanceX}, box ${gm.width} x ${gm.height})");
+
+    Result<GlyphMetrics, FreeTypeError> loaded = face.glyphMetrics(glyph: a, hinting: Hinting::Light);
+    bool sameMetrics = match (loaded) {
+        case Ok(value: lm): lm.advanceX == gm.advanceX && lm.width == gm.width && lm.bearingY == gm.bearingY;
+        case Err(error: e): false;
+    };
+    check(t: t, ok: sameMetrics, what: "glyphMetrics answers the rendered glyph's metrics without a bitmap");
+
+    uint32 space = face.glyphIndex(codepoint: 32);
+    Result<Glyph, FreeTypeError> renderedSpace = face.render(glyph: space, hinting: Hinting::Light);
+    bool blank = match (renderedSpace) {
+        case Ok(value: g): g.width() == 0 && g.rows() == 0 && g.metrics().advanceX > 0;
+        case Err(error: e): false;
+    };
+    check(t: t, ok: blank, what: "a space renders as no pixels and an advance");
+
+    uint32 gee = face.glyphIndex(codepoint: 103);
+    Result<Glyph, FreeTypeError> renderedG = face.render(glyph: gee, hinting: Hinting::Light);
+    bool descends = match (renderedG) {
+        case Ok(value: g): g.top() - g.rows() < 0 && g.top() > 0;
+        case Err(error: e): false;
+    };
+    check(t: t, ok: descends, what: "g reaches below the baseline");
+
+    Result<Unit, FreeTypeError> bigger = face.setPixelSize(width: 0, height: 64);
+    Result<Glyph, FreeTypeError> renderedBig = face.render(glyph: a, hinting: Hinting::Light);
+    int32 bigRows = match (renderedBig) { case Ok(value: g): g.rows(); case Err(error: e): 0; };
+    check(t: t, ok: bigRows >= r * 2 - 2 && bigRows <= r * 2 + 2, what: "twice the size, twice the rows (${bigRows} vs ${r})");
+
+    // ---- errors ----
+    uint32 past = cast<uint32>(LATO_GLYPHS) + 5;
+    Result<Glyph, FreeTypeError> bad = face.render(glyph: past, hinting: Hinting::Light);
+    match (bad) {
+        case Ok(value: g): { check(t: t, ok: false, what: "a glyph past the last one is refused"); }
+        case Err(error: e): {
+            string msg = e.message();
+            bool named = match (e) { case Glyph(glyph: n, code: c, detail: d): n == past && c != 0 && d.length() > 0; case Init(code: c, detail: d): false; case Open(source: so, code: c, detail: d): false; case Size(code: c, detail: d): false; };
+            check(t: t, ok: named, what: "a glyph past the last one is refused, by number ('${msg}')");
+        }
+    };
+    Result<Unit, FreeTypeError> zero = face.setPixelSize(width: 0, height: 0);
+    bool refused = match (zero) { case Ok(value: u): false; case Err(error: e): true; };
+    check(t: t, ok: refused, what: "a 0 x 0 size is refused");
+
+    // ---- the same font from bytes ----
+    Result<DynamicArray<uint8>, IoError> read = readFile(path: path);
+    DynamicArray<uint8> bytes = match (give read) {
+        case Ok(value: b): give b;
+        case Err(error: e): {
+            check(t: t, ok: false, what: "the font file reads");
+            return;
+        }
+    };
+    Result<Face, FreeTypeError> fromBytes = Face.fromBytes(library: ft, bytes: bytes.view(), index: 0);
+    Face memory = match (give fromBytes) {
+        case Ok(value: f): give f;
+        case Err(error: e): {
+            string why = e.message();
+            check(t: t, ok: false, what: "Lato opens from bytes: ${why}");
+            return;
+        }
+    };
+    bytes.clear();
+    Result<Unit, FreeTypeError> s1 = face.setPixelSize(width: 0, height: 32);
+    Result<Unit, FreeTypeError> s2 = memory.setPixelSize(width: 0, height: 32);
+    check(t: t, ok: memory.glyphIndex(codepoint: 65) == a, what: "from bytes, A is the same glyph");
+    Result<Glyph, FreeTypeError> fromFile = face.render(glyph: a, hinting: Hinting::Light);
+    Result<Glyph, FreeTypeError> fromMemory = memory.render(glyph: a, hinting: Hinting::Light);
+    bool same = match (fromFile) {
+        case Ok(value: x): match (fromMemory) {
+            case Ok(value: y): sameBitmap(a: x, b: y);
+            case Err(error: e): false;
+        };
+        case Err(error: e): false;
+    };
+    check(t: t, ok: same, what: "...and renders to the same pixels, after the caller's bytes are gone");
+}
+
+fn void cffFace(ref Tally t, const ref FreeType ft)
+{
+    string path = scpPath();
+    Result<Face, FreeTypeError> opened = Face.open(library: ft, path: path, index: 0);
+    Face face = match (give opened) {
+        case Ok(value: f): give f;
+        case Err(error: e): {
+            string why = e.message();
+            check(t: t, ok: false, what: "Source Code Pro (CFF) opens: ${why}");
+            return;
+        }
+    };
+    check(t: t, ok: true, what: "Source Code Pro (CFF) opens");
+    check(t: t, ok: face.isCff() && face.isSfnt() && face.isScalable(), what: "CFF outlines in an SFNT, read by the cff driver");
+    check(t: t, ok: face.isFixedWidth(), what: "a monospaced face says so");
+    check(t: t, ok: !face.hasKerning(), what: "no 'kern' table");
+    FaceMetrics m = face.metrics();
+    int32 glyphs = face.glyphCount();
+    check(t: t, ok: m.unitsPerEm == SCP_UPM && glyphs == SCP_GLYPHS,
+          what: "units per em and glyph count are the font's (${m.unitsPerEm}, ${glyphs})");
+    check(t: t, ok: m.ascender == SCP_ASCENDER && m.descender == SCP_DESCENDER,
+          what: "the line metrics are the font's (${m.ascender} ${m.descender})");
+    uint32 a = face.glyphIndex(codepoint: 65);
+    uint32 w = face.glyphIndex(codepoint: 87);
+    uint32 i = face.glyphIndex(codepoint: 105);
+    check(t: t, ok: a == SCP_GLYPH_A && w == SCP_GLYPH_W && i == SCP_GLYPH_I, what: "A, W, i map to cmap's glyphs (${a} ${w} ${i})");
+
+    Result<Unit, FreeTypeError> sized = face.setPixelSize(width: 0, height: 24);
+    int32 want = scaled(units: SCP_ADVANCE, ppem: 24, upm: SCP_UPM);
+    Result<Glyph, FreeTypeError> ra = face.render(glyph: a, hinting: Hinting::None);
+    Result<Glyph, FreeTypeError> rw = face.render(glyph: w, hinting: Hinting::None);
+    Result<Glyph, FreeTypeError> ri = face.render(glyph: i, hinting: Hinting::None);
+    int32 adA = match (ra) { case Ok(value: g): g.metrics().advanceX; case Err(error: e): -1; };
+    int32 adW = match (rw) { case Ok(value: g): g.metrics().advanceX; case Err(error: e): -2; };
+    int32 adI = match (ri) { case Ok(value: g): g.metrics().advanceX; case Err(error: e): -3; };
+    check(t: t, ok: adA == adW && adW == adI, what: "A, W and i advance alike (${adA} ${adW} ${adI})");
+    check(t: t, ok: near(a: adA, b: want, slack: 1), what: "...by hmtx's advance, scaled (want ${want})");
+    int32 inkW = match (rw) { case Ok(value: g): inkOf(g: g).inked; case Err(error: e): 0; };
+    int32 inkI = match (ri) { case Ok(value: g): inkOf(g: g).inked; case Err(error: e): 0; };
+    check(t: t, ok: inkW > inkI && inkI > 0, what: "W carries more ink than i in the same cell (${inkW} vs ${inkI})");
+    Ink inkA = match (ra) { case Ok(value: g): inkOf(g: g); case Err(error: e): Ink.zero(); };
+    check(t: t, ok: inkA.full > 0 && inkA.partial > 0, what: "CFF outlines anti-alias (${inkA.full} full, ${inkA.partial} partial)");
+    Result<Glyph, FreeTypeError> hinted = face.render(glyph: a, hinting: Hinting::Default);
+    bool hintedOk = match (hinted) { case Ok(value: g): g.rows() > 0; case Err(error: e): false; };
+    check(t: t, ok: hintedOk, what: "the CFF hinter (pshinter) renders A too");
+    int32 noKern = face.kerning(left: a, right: w, mode: KerningMode::Default);
+    check(t: t, ok: noKern == 0, what: "kerning without a 'kern' table is 0");
+}
+
+fn void openFailures(ref Tally t, const ref FreeType ft)
+{
+    string nowhere = "tests/fonts/no-such-font.ttf";
+    Result<Face, FreeTypeError> missing = Face.open(library: ft, path: nowhere, index: 0);
+    match (missing) {
+        case Ok(value: f): { check(t: t, ok: false, what: "a missing file is refused"); }
+        case Err(error: e): {
+            string msg = e.message();
+            check(t: t, ok: msg.contains(substring: nowhere), what: "a missing file is refused, by path ('${msg}')");
+        }
+    };
+    string path = latoPath();
+    Result<Face, FreeTypeError> pastLast = Face.open(library: ft, path: path, index: 3);
+    bool refused = match (pastLast) { case Ok(value: f): false; case Err(error: e): true; };
+    check(t: t, ok: refused, what: "a face index past the file's last is refused");
+    string junk = "this is not a font, though it is long enough to look like a header to a careless reader";
+    Result<Face, FreeTypeError> notFont = Face.fromBytes(library: ft, bytes: junk.bytes(), index: 0);
+    match (notFont) {
+        case Ok(value: f): { check(t: t, ok: false, what: "bytes that are not a font are refused"); }
+        case Err(error: e): {
+            string msg = e.message();
+            check(t: t, ok: msg.contains(substring: "<bytes>"), what: "bytes that are not a font are refused ('${msg}')");
+        }
+    };
+}
+
+fn int32 main()
+{
+    Tally t = Tally.zero();
+    Result<FreeType, FreeTypeError> started = FreeType.init();
+    FreeType ft = match (give started) {
+        case Ok(value: f): give f;
+        case Err(error: e): {
+            string why = e.message();
+            println(s: "freetype tests: FreeType would not start: ${why}");
+            return 1;
+        }
+    };
+    string version = ft.version();
+    check(t: t, ok: version == "2.14.3", what: "the FreeType running is the vendored 2.14.3 ('${version}')");
+
+    trueTypeFace(t: t, ft: ft);
+    cffFace(t: t, ft: ft);
+    openFailures(t: t, ft: ft);
+
+    Result<Face, FreeTypeError> orphan = faceOutlivingItsLibrary();
+    Face kept = match (give orphan) {
+        case Ok(value: f): give f;
+        case Err(error: e): {
+            string why = e.message();
+            println(s: "  FAIL a face outliving its library opens: ${why}");
+            return 1;
+        }
+    };
+    Result<Unit, FreeTypeError> sized = kept.setPixelSize(width: 0, height: 20);
+    uint32 a = kept.glyphIndex(codepoint: 65);
+    Result<Glyph, FreeTypeError> drawn = kept.render(glyph: a, hinting: Hinting::Light);
+    bool alive = match (drawn) { case Ok(value: g): g.rows() > 0; case Err(error: e): false; };
+    check(t: t, ok: alive, what: "a face renders after the FreeType it came from is dropped");
+
+    if (t.failed != 0) {
+        println(s: "freetype tests: ${t.failed} of ${t.run} failed");
+        return 1;
+    }
+    println(s: "freetype tests: OK, ${t.run} checks (FreeType ${version})");
+    return 0;
+}

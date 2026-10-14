@@ -1,0 +1,46 @@
+{
+  "name": "@kama/freetype",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "kind": "library",
+  "kama": ">=0.9.577",
+  "description": "FreeType 2.14 vendored and bound: font faces in, glyph coverage bitmaps and metrics out",
+  "keywords": ["font", "freetype", "truetype", "opentype", "text"],
+  "repository": "https://github.com/cosmic-canopy/kama-freetype",
+  "publish": {
+    "exclude": [
+      "tools/", "tests/",
+      "AGENTS.md", "AGENTS.package.md", "AGENTS.freetype.md", "CLAUDE.md", "KAMA_GAPS.md"
+    ]
+  },
+  "modules": {
+    ".": { "visibility": "public" }
+  },
+  "cincludes": [
+    "third_party/freetype/include"
+  ],
+  "csources": [
+    "csrc/kama_freetype.c",
+    "csrc/ft/ft_autofit_autofit.c",
+    "csrc/ft/ft_base_ftbase.c",
+    "csrc/ft/ft_base_ftbbox.c",
+    "csrc/ft/ft_base_ftbitmap.c",
+    "csrc/ft/ft_base_ftdebug.c",
+    "csrc/ft/ft_base_ftfstype.c",
+    "csrc/ft/ft_base_ftgasp.c",
+    "csrc/ft/ft_base_ftglyph.c",
+    "csrc/ft/ft_base_ftinit.c",
+    "csrc/ft/ft_base_ftmm.c",
+    "csrc/ft/ft_base_ftstroke.c",
+    "csrc/ft/ft_base_ftsynth.c",
+    "csrc/ft/ft_base_ftsystem.c",
+    "csrc/ft/ft_base_fttype1.c",
+    "csrc/ft/ft_cff_cff.c",
+    "csrc/ft/ft_psaux_psaux.c",
+    "csrc/ft/ft_pshinter_pshinter.c",
+    "csrc/ft/ft_psnames_psnames.c",
+    "csrc/ft/ft_sfnt_sfnt.c",
+    "csrc/ft/ft_smooth_smooth.c",
+    "csrc/ft/ft_truetype_truetype.c"
+  ]
+}

@@ -1,0 +1,475 @@
+// @kama/freetype — FreeType 2.14 for kama: font files in, glyph coverage bitmaps and metrics out. A general binding of
+// the part of FreeType that text needs, with no opinion about the program using it.
+//
+//   FreeType    the library: start it (`init`), ask its version; it goes when the last of it and its faces does
+//   Face        one font face, from a file or from bytes: names, flags, design metrics; set a pixel size; map a code
+//               point to a glyph; render a glyph; advances and kerning
+//   Glyph       one rendered glyph: an 8-bit coverage bitmap (top row first, tightly packed) and its metrics
+//
+// Numbers are FreeType's own. Design metrics are font units. Everything at a size is 26.6 fixed point, which is 64ths
+// of a pixel, so `(advance + 32) / 64` is the advance in whole pixels.
+//
+// FreeType itself is vendored (third_party/freetype, the FTL taken) and compiled into the program. Nothing here shapes
+// text: HarfBuzz is not vendored, so a run of glyphs is laid out by advances and the 'kern' table, which is what
+// FreeType alone can do. README.md has the details.
+
+import { std::collections::ConstView, std::collections::FixedArray };
+export { FreeType, FreeTypeError, Face, FaceMetrics, SizeMetrics, Glyph, GlyphMetrics, Hinting, KerningMode };
+
+extern "kama_freetype.h";
+extern fn UnsafeConstPtr<uint8> kft_error_string(int32 error, UnsafePtr<int32> len);
+extern fn UnsafePtr kft_library_new(UnsafePtr<int32> error);
+extern fn void kft_library_release(UnsafePtr library);
+extern fn int32 kft_library_version(UnsafeConstPtr library);
+extern fn UnsafePtr kft_face_open(UnsafePtr library, UnsafeConstPtr<cchar> path, int32 index, UnsafePtr<int32> error);
+extern fn UnsafePtr kft_face_from_bytes(UnsafePtr library, UnsafeConstPtr<uint8> data, usize len, int32 index,
+                                        UnsafePtr<int32> error);
+extern fn void kft_face_free(UnsafePtr face);
+extern fn void kft_face_info(UnsafeConstPtr face, UnsafePtr<int32> values, int32 n);
+extern fn UnsafeConstPtr<uint8> kft_face_family(UnsafeConstPtr face, UnsafePtr<int32> len);
+extern fn UnsafeConstPtr<uint8> kft_face_style(UnsafeConstPtr face, UnsafePtr<int32> len);
+extern fn int32 kft_face_set_pixel_size(UnsafePtr face, int32 width, int32 height);
+extern fn uint32 kft_face_glyph_index(UnsafePtr face, uint32 codepoint);
+extern fn int32 kft_face_load_glyph(UnsafePtr face, uint32 glyph, int32 hinting);
+extern fn int32 kft_face_render_glyph(UnsafePtr face, uint32 glyph, int32 hinting);
+extern fn void kft_glyph_info(UnsafeConstPtr face, UnsafePtr<int32> values, int32 n);
+extern fn int32 kft_glyph_copy_bitmap(UnsafeConstPtr face, UnsafePtr<uint8> dst, usize cap);
+extern fn int32 kft_face_advance(UnsafePtr face, uint32 glyph, int32 hinting, UnsafePtr<int32> advance);
+extern fn int32 kft_face_kerning(UnsafePtr face, uint32 left, uint32 right, int32 mode, UnsafePtr<int32> x,
+                                 UnsafePtr<int32> y);
+
+// The runtime's string constructor. ⚠️ It must match every other declaration of it EXACTLY (std's, and other packages'):
+// it is one C symbol, kama emits no prototype for an extern, and the extern-agreement rule is what keeps them in step.
+extern fn string kama_string_from_raw(UnsafeConstPtr<uint8> src, isize start, isize len);
+
+// The slots of kama_freetype.h's two int32 arrays. csrc/kama_freetype.c static-asserts both counts.
+comptime int32 FACE_N = 18;
+comptime isize F_NUM_FACES = 0;
+comptime isize F_INDEX = 1;
+comptime isize F_NUM_GLYPHS = 2;
+comptime isize F_UNITS_PER_EM = 3;
+comptime isize F_ASCENDER = 4;
+comptime isize F_DESCENDER = 5;
+comptime isize F_HEIGHT = 6;
+comptime isize F_MAX_ADVANCE_WIDTH = 7;
+comptime isize F_FLAGS = 8;
+comptime isize F_NUM_FIXED_SIZES = 9;
+comptime isize F_X_PPEM = 10;
+comptime isize F_Y_PPEM = 11;
+comptime isize F_SIZE_ASCENDER = 12;
+comptime isize F_SIZE_DESCENDER = 13;
+comptime isize F_SIZE_HEIGHT = 14;
+comptime isize F_SIZE_MAX_ADVANCE = 15;
+comptime isize F_UNDERLINE_POSITION = 16;
+comptime isize F_UNDERLINE_THICKNESS = 17;
+
+comptime int32 FLAG_SCALABLE = 1;
+comptime int32 FLAG_FIXED_WIDTH = 2;
+comptime int32 FLAG_KERNING = 4;
+comptime int32 FLAG_VARIATION = 8;
+comptime int32 FLAG_ITALIC = 16;
+comptime int32 FLAG_BOLD = 32;
+comptime int32 FLAG_SFNT = 64;
+comptime int32 FLAG_CFF = 128;
+
+comptime int32 GLYPH_N = 12;
+comptime isize G_INDEX = 0;
+comptime isize G_WIDTH = 1;
+comptime isize G_ROWS = 2;
+comptime isize G_LEFT = 3;
+comptime isize G_TOP = 4;
+comptime isize G_ADVANCE_X = 5;
+comptime isize G_ADVANCE_Y = 6;
+comptime isize G_METRIC_WIDTH = 7;
+comptime isize G_METRIC_HEIGHT = 8;
+comptime isize G_BEARING_X = 9;
+comptime isize G_BEARING_Y = 10;
+
+// ---- errors -------------------------------------------------------------------------------------------------------
+
+// What failed, with FreeType's FT_Error `code` and FreeType's own words for it (`detail`).
+type enum FreeTypeError implements Error {
+    // FreeType would not start (FT_Init_FreeType): out of memory, in practice.
+    Init(int32 code, string detail),
+    // A face would not open: a missing file, a format none of the vendored drivers reads (README.md, "What it
+    // reads"), or a face index past the file's last face. `source` is the path, or "<bytes>".
+    Open(string source, int32 code, string detail),
+    // A pixel size the face cannot take: zero, negative, or not one of a bitmap-only face's fixed sizes.
+    Size(int32 code, string detail),
+    // A glyph would not load or render: an index past the face's last glyph, or a broken outline.
+    Glyph(uint32 glyph, int32 code, string detail);
+
+    public const fn string message() {
+        return match (this) {
+            case Init(code: c, detail: d):              "FreeType would not start: ${d} (FreeType error ${c})";
+            case Open(source: s, code: c, detail: d):   "could not open the face ${s}: ${d} (FreeType error ${c})";
+            case Size(code: c, detail: d):              "the face refused the size: ${d} (FreeType error ${c})";
+            case Glyph(glyph: g, code: c, detail: d):   "glyph ${g} would not load: ${d} (FreeType error ${c})";
+        };
+    }
+}
+
+unsafe fn string bytesOf(UnsafeConstPtr<uint8> p, int32 n)
+{
+    if (n <= 0) { return ""; }
+    return kama_string_from_raw(src: p, start: 0, len: cast<isize>(n));
+}
+
+unsafe fn string errorText(int32 code)
+{
+    int32 n = 0;
+    UnsafeConstPtr<uint8> p = kft_error_string(error: code, len: addr(of: n));
+    return bytesOf(p: p, n: n);
+}
+
+// ---- small values -------------------------------------------------------------------------------------------------
+
+// How a glyph is hinted (fitted to the pixel grid) before it is rendered.
+type enum Hinting {
+    // The face's own hinting: its TrueType bytecode, or the auto-hinter for a face without any (and for CFF).
+    Default,
+    // The auto-hinter's light mode: vertical only, so shapes and advances stay closest to the design. What most
+    // UI text wants.
+    Light,
+    // None: the outline exactly as designed, scaled.
+    None,
+    // The auto-hinter, even where the face has hinting of its own.
+    Auto
+}
+
+fn int32 hintingCode(Hinting h)
+{
+    return match (h) {
+        case Default: 0;
+        case Light:   1;
+        case None:    2;
+        case Auto:    3;
+    };
+}
+
+// Which kerning `Face.kerning` answers: grid-fitted 26.6 (what a renderer at this size places by), unfitted 26.6, or
+// unscaled font units.
+type enum KerningMode { Default, Unfitted, Unscaled }
+
+// A face's design metrics, in font units (FreeType's FT_FaceRec). All zero for a bitmap-only face.
+type value FaceMetrics {
+    public int32 unitsPerEm;
+    public int32 ascender;            // above the baseline
+    public int32 descender;           // negative: below the baseline
+    public int32 height;              // baseline to baseline
+    public int32 maxAdvanceWidth;
+    public int32 underlinePosition;
+    public int32 underlineThickness;
+
+    public ctor zero()
+    {
+        this.unitsPerEm = 0;
+        this.ascender = 0;
+        this.descender = 0;
+        this.height = 0;
+        this.maxAdvanceWidth = 0;
+        this.underlinePosition = 0;
+        this.underlineThickness = 0;
+    }
+}
+
+// The metrics at the size set: pixels per em, and the rest in 26.6. All zero before a size is set.
+type value SizeMetrics {
+    public int32 xPpem;
+    public int32 yPpem;
+    public int32 ascender;
+    public int32 descender;           // negative
+    public int32 height;              // the line spacing
+    public int32 maxAdvance;
+
+    public ctor zero()
+    {
+        this.xPpem = 0;
+        this.yPpem = 0;
+        this.ascender = 0;
+        this.descender = 0;
+        this.height = 0;
+        this.maxAdvance = 0;
+    }
+}
+
+// One loaded glyph's metrics at the size set, 26.6: the pen's advance, and the outline's box from the pen position
+// (bearingY is from the baseline up to the box's top).
+type value GlyphMetrics {
+    public uint32 glyph;
+    public int32 advanceX;
+    public int32 advanceY;
+    public int32 width;
+    public int32 height;
+    public int32 bearingX;
+    public int32 bearingY;
+
+    public ctor zero()
+    {
+        this.glyph = 0;
+        this.advanceX = 0;
+        this.advanceY = 0;
+        this.width = 0;
+        this.height = 0;
+        this.bearingX = 0;
+        this.bearingY = 0;
+    }
+}
+
+// ---- the library --------------------------------------------------------------------------------------------------
+
+// FreeType itself. Open faces with it; it stays alive while any face opened from it does, so the order the two are
+// dropped in does not matter (kama_freetype.h: the library is reference-counted).
+type resource FreeType {
+    UnsafePtr handle;
+
+    unsafe ctor adopt(UnsafePtr handle) { this.handle = handle; }
+
+    public unsafe ctor Result<FreeType, FreeTypeError> init()
+    {
+        int32 e = 0;
+        UnsafePtr h = kft_library_new(error: addr(of: e));
+        if (h == null) { return Result::Err(error: FreeTypeError::Init(code: e, detail: errorText(code: e))); }
+        return Result::Ok(value: FreeType.adopt(handle: h));
+    }
+
+    // The FreeType version running, "2.14.3".
+    public unsafe const fn string version()
+    {
+        int32 v = kft_library_version(library: this.handle);
+        int32 major = v / 10000;
+        int32 minor = (v / 100) % 100;
+        int32 patch = v % 100;
+        return "${major}.${minor}.${patch}";
+    }
+
+    friend freetype::Face::open[raw];
+    friend freetype::Face::fromBytes[raw];
+    unsafe const fn UnsafePtr raw() { return this.handle; }
+
+    unsafe ~FreeType() { if (this.handle != null) { kft_library_release(library: this.handle); } }
+}
+
+// ---- faces --------------------------------------------------------------------------------------------------------
+
+// One face of a font. TrueType (glyf) and OpenType (CFF) outlines, in a single file or a collection (.ttc, .otc).
+type resource Face {
+    UnsafePtr handle;
+
+    unsafe ctor adopt(UnsafePtr handle) { this.handle = handle; }
+
+    // The face numbered `index` in the file at `path` (0 for a single-face file). A variable font's named instance n
+    // is `index + n * 65536`, FreeType's own encoding.
+    public unsafe ctor Result<Face, FreeTypeError> open(const ref FreeType library, const ref string path, int32 index)
+    {
+        int32 e = 0;
+        UnsafePtr h = kft_face_open(library: library.raw(), path: path.cstr(), index: index, error: addr(of: e));
+        if (h == null) {
+            return Result::Err(error: FreeTypeError::Open(source: copy path, code: e, detail: errorText(code: e)));
+        }
+        return Result::Ok(value: Face.adopt(handle: h));
+    }
+
+    // The face numbered `index` in a font already in memory. The face keeps its own copy of the bytes.
+    public unsafe ctor Result<Face, FreeTypeError> fromBytes(const ref FreeType library, ConstView<uint8> bytes, int32 index)
+    {
+        int32 e = 0;
+        UnsafePtr h = kft_face_from_bytes(library: library.raw(), data: bytes.dataPtr(), len: cast<usize>(bytes.length()),
+                                          index: index, error: addr(of: e));
+        if (h == null) {
+            return Result::Err(error: FreeTypeError::Open(source: "<bytes>", code: e, detail: errorText(code: e)));
+        }
+        return Result::Ok(value: Face.adopt(handle: h));
+    }
+
+    unsafe const fn int32 info(isize slot)
+    {
+        InlineArray<int32>#(18) v = [0; 18];
+        kft_face_info(face: this.handle, values: cast<UnsafePtr<int32>>(addr(of: v[0])), n: FACE_N);
+        return v[slot];
+    }
+
+    unsafe const fn bool flag(int32 bit) { return (this.info(slot: F_FLAGS) & bit) != 0; }
+
+    public unsafe const fn string familyName()
+    {
+        int32 n = 0;
+        UnsafeConstPtr<uint8> p = kft_face_family(face: this.handle, len: addr(of: n));
+        return bytesOf(p: p, n: n);
+    }
+
+    public unsafe const fn string styleName()
+    {
+        int32 n = 0;
+        UnsafeConstPtr<uint8> p = kft_face_style(face: this.handle, len: addr(of: n));
+        return bytesOf(p: p, n: n);
+    }
+
+    // How many faces the file holds, and which one this is.
+    public unsafe const fn int32 faceCount() { return this.info(slot: F_NUM_FACES); }
+    public unsafe const fn int32 faceIndex() { return this.info(slot: F_INDEX); }
+    public unsafe const fn int32 glyphCount() { return this.info(slot: F_NUM_GLYPHS); }
+    public unsafe const fn int32 fixedSizeCount() { return this.info(slot: F_NUM_FIXED_SIZES); }
+
+    public unsafe const fn bool isScalable() { return this.flag(bit: FLAG_SCALABLE); }
+    public unsafe const fn bool isFixedWidth() { return this.flag(bit: FLAG_FIXED_WIDTH); }
+    // A legacy 'kern' table, which is what `kerning` reads. A face that kerns only through GPOS answers false.
+    public unsafe const fn bool hasKerning() { return this.flag(bit: FLAG_KERNING); }
+    public unsafe const fn bool isVariable() { return this.flag(bit: FLAG_VARIATION); }
+    public unsafe const fn bool isItalic() { return this.flag(bit: FLAG_ITALIC); }
+    public unsafe const fn bool isBold() { return this.flag(bit: FLAG_BOLD); }
+    // TrueType/OpenType container, and within one, PostScript (CFF) outlines rather than TrueType ones.
+    public unsafe const fn bool isSfnt() { return this.flag(bit: FLAG_SFNT); }
+    public unsafe const fn bool isCff() { return this.flag(bit: FLAG_CFF); }
+
+    public unsafe const fn FaceMetrics metrics()
+    {
+        InlineArray<int32>#(18) v = [0; 18];
+        kft_face_info(face: this.handle, values: cast<UnsafePtr<int32>>(addr(of: v[0])), n: FACE_N);
+        FaceMetrics m = FaceMetrics.zero();
+        m.unitsPerEm = v[F_UNITS_PER_EM];
+        m.ascender = v[F_ASCENDER];
+        m.descender = v[F_DESCENDER];
+        m.height = v[F_HEIGHT];
+        m.maxAdvanceWidth = v[F_MAX_ADVANCE_WIDTH];
+        m.underlinePosition = v[F_UNDERLINE_POSITION];
+        m.underlineThickness = v[F_UNDERLINE_THICKNESS];
+        return m;
+    }
+
+    // Render at `width` x `height` pixels per em. Pass 0 for one of them to make it match the other.
+    public unsafe fn Result<Unit, FreeTypeError> setPixelSize(int32 width, int32 height)
+    {
+        int32 e = kft_face_set_pixel_size(face: this.handle, width: width, height: height);
+        if (e != 0) { return Result::Err(error: FreeTypeError::Size(code: e, detail: errorText(code: e))); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    public unsafe const fn SizeMetrics sizeMetrics()
+    {
+        InlineArray<int32>#(18) v = [0; 18];
+        kft_face_info(face: this.handle, values: cast<UnsafePtr<int32>>(addr(of: v[0])), n: FACE_N);
+        SizeMetrics m = SizeMetrics.zero();
+        m.xPpem = v[F_X_PPEM];
+        m.yPpem = v[F_Y_PPEM];
+        m.ascender = v[F_SIZE_ASCENDER];
+        m.descender = v[F_SIZE_DESCENDER];
+        m.height = v[F_SIZE_HEIGHT];
+        m.maxAdvance = v[F_SIZE_MAX_ADVANCE];
+        return m;
+    }
+
+    // The glyph for a Unicode code point, through the face's Unicode charmap. 0 (".notdef") when the face has none.
+    public unsafe fn uint32 glyphIndex(uint32 codepoint)
+    {
+        return kft_face_glyph_index(face: this.handle, codepoint: codepoint);
+    }
+
+    // A glyph's metrics at the size set, without rendering it.
+    public unsafe fn Result<GlyphMetrics, FreeTypeError> glyphMetrics(uint32 glyph, Hinting hinting)
+    {
+        int32 e = kft_face_load_glyph(face: this.handle, glyph: glyph, hinting: hintingCode(h: hinting));
+        if (e != 0) { return Result::Err(error: FreeTypeError::Glyph(glyph: glyph, code: e, detail: errorText(code: e))); }
+        InlineArray<int32>#(12) v = [0; 12];
+        kft_glyph_info(face: this.handle, values: cast<UnsafePtr<int32>>(addr(of: v[0])), n: GLYPH_N);
+        return Result::Ok(value: metricsOf(v: v));
+    }
+
+    // A glyph rendered to an 8-bit coverage bitmap (0 none, 255 full) at the size set.
+    public unsafe fn Result<Glyph, FreeTypeError> render(uint32 glyph, Hinting hinting)
+    {
+        int32 e = kft_face_render_glyph(face: this.handle, glyph: glyph, hinting: hintingCode(h: hinting));
+        if (e != 0) { return Result::Err(error: FreeTypeError::Glyph(glyph: glyph, code: e, detail: errorText(code: e))); }
+        InlineArray<int32>#(12) v = [0; 12];
+        kft_glyph_info(face: this.handle, values: cast<UnsafePtr<int32>>(addr(of: v[0])), n: GLYPH_N);
+        int32 width = v[G_WIDTH];
+        int32 rows = v[G_ROWS];
+        isize size = cast<isize>(width) * cast<isize>(rows);
+        FixedArray<uint8> pixels = FixedArray.make(size: size);
+        if (size > 0) {
+            int32 got = kft_glyph_copy_bitmap(face: this.handle, dst: pixels.dataPtrMut(), cap: cast<usize>(size));
+            if (cast<isize>(got) != size) { panic(msg: "freetype::Face.render: the slot's bitmap changed size"); }
+        }
+        return Result::Ok(value: Glyph.make(metrics: metricsOf(v: v), width: width, rows: rows, left: v[G_LEFT],
+                                            top: v[G_TOP], pixels: give pixels));
+    }
+
+    // The horizontal advance of a glyph at the size set, 26.6, without rendering it. 0 for a glyph that fails.
+    public unsafe fn int32 advance(uint32 glyph, Hinting hinting)
+    {
+        int32 a = 0;
+        int32 e = kft_face_advance(face: this.handle, glyph: glyph, hinting: hintingCode(h: hinting), advance: addr(of: a));
+        if (e != 0) { return 0; }
+        return a;
+    }
+
+    // The horizontal kerning between two glyphs, from the face's 'kern' table (see `hasKerning`): 26.6, or font units
+    // when `mode` is Unscaled. 0 for a pair it does not kern, and for a face without the table.
+    public unsafe fn int32 kerning(uint32 left, uint32 right, KerningMode mode)
+    {
+        int32 m = match (mode) { case Default: 0; case Unfitted: 1; case Unscaled: 2; };
+        int32 x = 0;
+        int32 y = 0;
+        int32 e = kft_face_kerning(face: this.handle, left: left, right: right, mode: m, x: addr(of: x), y: addr(of: y));
+        if (e != 0) { return 0; }
+        return x;
+    }
+
+    unsafe ~Face() { if (this.handle != null) { kft_face_free(face: this.handle); } }
+}
+
+fn GlyphMetrics metricsOf(const ref InlineArray<int32>#(12) v)
+{
+    GlyphMetrics m = GlyphMetrics.zero();
+    m.glyph = cast<uint32>(v[G_INDEX]);
+    m.advanceX = v[G_ADVANCE_X];
+    m.advanceY = v[G_ADVANCE_Y];
+    m.width = v[G_METRIC_WIDTH];
+    m.height = v[G_METRIC_HEIGHT];
+    m.bearingX = v[G_BEARING_X];
+    m.bearingY = v[G_BEARING_Y];
+    return m;
+}
+
+// ---- a rendered glyph ---------------------------------------------------------------------------------------------
+
+// One rendered glyph: `width` x `rows` coverage bytes, top row first, tightly packed, owned. Place its top-left
+// corner at (pen x + left, baseline - top), then advance the pen by `metrics().advanceX` (26.6). The bytes are a
+// window like any container's: `borrow glyph.view() as px { … }`, or one at a time through `at`.
+type resource Glyph implements Viewable<ConstView<uint8>> {
+    GlyphMetrics m;
+    int32 w;
+    int32 r;
+    int32 l;
+    int32 t;
+    FixedArray<uint8> px;
+
+    friend freetype::Face::render[make];
+    ctor make(GlyphMetrics metrics, int32 width, int32 rows, int32 left, int32 top, FixedArray<uint8> pixels)
+    {
+        this.m = metrics;
+        this.w = width;
+        this.r = rows;
+        this.l = left;
+        this.t = top;
+        this.px = give pixels;
+    }
+
+    public const fn GlyphMetrics metrics() { return this.m; }
+    public const fn uint32 index() { return this.m.glyph; }
+    public const fn int32 width() { return this.w; }
+    public const fn int32 rows() { return this.r; }
+    public const fn int32 left() { return this.l; }
+    public const fn int32 top() { return this.t; }
+
+    // The coverage bytes, `width` a row, top row first.
+    public unsafe const fn ConstView<uint8> view() { return this.px.view(); }
+
+    // The coverage at column x, row y (0 at the top). A panic outside the bitmap, like an index out of range.
+    public unsafe const fn uint8 at(int32 x, int32 y)
+    {
+        if (x < 0 || y < 0 || x >= this.w || y >= this.r) { panic(msg: "freetype::Glyph.at: outside the bitmap"); }
+        UnsafeConstPtr<uint8> p = this.px.dataPtr();
+        return p[cast<isize>(y) * cast<isize>(this.w) + cast<isize>(x)];
+    }
+}
